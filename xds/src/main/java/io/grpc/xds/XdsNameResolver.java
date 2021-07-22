@@ -22,9 +22,11 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
+import com.google.protobuf.util.Durations;
 import io.grpc.Attributes;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
@@ -40,21 +42,21 @@ import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.NameResolver;
 import io.grpc.Status;
+import io.grpc.Status.Code;
 import io.grpc.SynchronizationContext;
 import io.grpc.internal.GrpcUtil;
 import io.grpc.internal.ObjectPool;
 import io.grpc.xds.Filter.ClientInterceptorBuilder;
 import io.grpc.xds.Filter.FilterConfig;
 import io.grpc.xds.Filter.NamedFilterConfig;
-import io.grpc.xds.Matchers.FractionMatcher;
-import io.grpc.xds.Matchers.HeaderMatcher;
-import io.grpc.xds.Matchers.PathMatcher;
 import io.grpc.xds.ThreadSafeRandom.ThreadSafeRandomImpl;
 import io.grpc.xds.VirtualHost.Route;
 import io.grpc.xds.VirtualHost.Route.RouteAction;
 import io.grpc.xds.VirtualHost.Route.RouteAction.ClusterWeight;
 import io.grpc.xds.VirtualHost.Route.RouteAction.HashPolicy;
+import io.grpc.xds.VirtualHost.Route.RouteAction.RetryPolicy;
 import io.grpc.xds.VirtualHost.Route.RouteMatch;
+import io.grpc.xds.VirtualHost.Route.RouteMatch.PathMatcher;
 import io.grpc.xds.XdsClient.LdsResourceWatcher;
 import io.grpc.xds.XdsClient.LdsUpdate;
 import io.grpc.xds.XdsClient.RdsResourceWatcher;
@@ -62,6 +64,8 @@ import io.grpc.xds.XdsClient.RdsUpdate;
 import io.grpc.xds.XdsLogger.XdsLogLevel;
 import io.grpc.xds.XdsNameResolverProvider.CallCounterProvider;
 import io.grpc.xds.XdsNameResolverProvider.XdsClientPoolFactory;
+import io.grpc.xds.internal.Matchers.FractionMatcher;
+import io.grpc.xds.internal.Matchers.HeaderMatcher;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -176,14 +180,38 @@ final class XdsNameResolver extends NameResolver {
   }
 
   @VisibleForTesting
-  static Map<String, ?> generateServiceConfigWithMethodTimeoutConfig(long timeoutNano) {
-    String timeout = timeoutNano / 1_000_000_000.0 + "s";
-    Map<String, Object> methodConfig = new HashMap<>();
+  static Map<String, ?> generateServiceConfigWithMethodConfig(
+      @Nullable Long timeoutNano, @Nullable RetryPolicy retryPolicy) {
+    if (timeoutNano == null && retryPolicy == null) {
+      return Collections.emptyMap();
+    }
+    ImmutableMap.Builder<String, Object> methodConfig = ImmutableMap.builder();
     methodConfig.put(
         "name", Collections.singletonList(Collections.emptyMap()));
-    methodConfig.put("timeout", timeout);
+    if (retryPolicy != null) {
+      ImmutableMap.Builder<String, Object> rawRetryPolicy = ImmutableMap.builder();
+      rawRetryPolicy.put("maxAttempts", (double) retryPolicy.maxAttempts());
+      rawRetryPolicy.put("initialBackoff", Durations.toString(retryPolicy.initialBackoff()));
+      rawRetryPolicy.put("maxBackoff", Durations.toString(retryPolicy.maxBackoff()));
+      rawRetryPolicy.put("backoffMultiplier", 2D);
+      List<String> codes = new ArrayList<>(retryPolicy.retryableStatusCodes().size());
+      for (Code code : retryPolicy.retryableStatusCodes()) {
+        codes.add(code.name());
+      }
+      rawRetryPolicy.put(
+          "retryableStatusCodes", Collections.unmodifiableList(codes));
+      if (retryPolicy.perAttemptRecvTimeout() != null) {
+        rawRetryPolicy.put(
+            "perAttemptRecvTimeout", Durations.toString(retryPolicy.perAttemptRecvTimeout()));
+      }
+      methodConfig.put("retryPolicy", rawRetryPolicy.build());
+    }
+    if (timeoutNano != null) {
+      String timeout = timeoutNano / 1_000_000_000.0 + "s";
+      methodConfig.put("timeout", timeout);
+    }
     return Collections.singletonMap(
-        "methodConfig", Collections.singletonList(Collections.unmodifiableMap(methodConfig)));
+        "methodConfig", Collections.singletonList(methodConfig.build()));
   }
 
   @VisibleForTesting
@@ -334,26 +362,12 @@ final class XdsNameResolver extends NameResolver {
   private final class ConfigSelector extends InternalConfigSelector {
     @Override
     public Result selectConfig(PickSubchannelArgs args) {
-      // Index ASCII headers by key, multi-value headers are concatenated for matching purposes.
-      Map<String, String> asciiHeaders = new HashMap<>();
-      Metadata headers = args.getHeaders();
-      for (String headerName : headers.keys()) {
-        if (headerName.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
-          continue;
-        }
-        Metadata.Key<String> key = Metadata.Key.of(headerName, Metadata.ASCII_STRING_MARSHALLER);
-        Iterable<String> values = headers.getAll(key);
-        if (values != null) {
-          asciiHeaders.put(headerName, Joiner.on(",").join(values));
-        }
-      }
-      // Special hack for exposing headers: "content-type".
-      asciiHeaders.put("content-type", "application/grpc");
       String cluster = null;
       Route selectedRoute = null;
       RoutingConfig routingCfg;
       Map<String, FilterConfig> selectedOverrideConfigs;
       List<ClientInterceptor> filterInterceptors = new ArrayList<>();
+      Metadata headers = args.getHeaders();
       do {
         routingCfg = routingConfig;
         selectedOverrideConfigs = new HashMap<>(routingCfg.virtualHostOverrideConfig);
@@ -363,7 +377,7 @@ final class XdsNameResolver extends NameResolver {
         }
         for (Route route : routingCfg.routes) {
           if (matchRoute(route.routeMatch(), "/" + args.getMethodDescriptor().getFullMethodName(),
-              asciiHeaders, random)) {
+              headers, random)) {
             selectedRoute = route;
             selectedOverrideConfigs.putAll(route.filterConfigOverrides());
             break;
@@ -372,6 +386,10 @@ final class XdsNameResolver extends NameResolver {
         if (selectedRoute == null) {
           return Result.forError(
               Status.UNAVAILABLE.withDescription("Could not find xDS route matching RPC"));
+        }
+        if (selectedRoute.routeAction() == null) {
+          return Result.forError(Status.UNAVAILABLE.withDescription(
+              "Could not route RPC to Route with non-forwarding action"));
         }
         RouteAction action = selectedRoute.routeAction();
         if (action.cluster() != null) {
@@ -393,20 +411,23 @@ final class XdsNameResolver extends NameResolver {
           }
         }
       } while (!retainCluster(cluster));
-      // TODO(chengyuanzhang): avoid service config generation and parsing for each call.
-      Map<String, ?> rawServiceConfig = Collections.emptyMap();
+      Long timeoutNanos = null;
       if (enableTimeout) {
-        Long timeoutNanos = null;
         if (selectedRoute != null) {
           timeoutNanos = selectedRoute.routeAction().timeoutNano();
         }
         if (timeoutNanos == null) {
           timeoutNanos = routingCfg.fallbackTimeoutNano;
         }
-        if (timeoutNanos > 0) {
-          rawServiceConfig = generateServiceConfigWithMethodTimeoutConfig(timeoutNanos);
+        if (timeoutNanos <= 0) {
+          timeoutNanos = null;
         }
       }
+      RetryPolicy retryPolicy =
+          selectedRoute == null ? null : selectedRoute.routeAction().retryPolicy();
+      // TODO(chengyuanzhang): avoid service config generation and parsing for each call.
+      Map<String, ?> rawServiceConfig =
+          generateServiceConfigWithMethodConfig(timeoutNanos, retryPolicy);
       ConfigOrError parsedServiceConfig = serviceConfigParser.parseServiceConfig(rawServiceConfig);
       Object config = parsedServiceConfig.getConfig();
       if (config == null) {
@@ -442,7 +463,7 @@ final class XdsNameResolver extends NameResolver {
         }
       }
       final String finalCluster = cluster;
-      final long hash = generateHash(selectedRoute.routeAction().hashPolicies(), asciiHeaders);
+      final long hash = generateHash(selectedRoute.routeAction().hashPolicies(), headers);
       class ClusterSelectionInterceptor implements ClientInterceptor {
         @Override
         public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
@@ -517,13 +538,13 @@ final class XdsNameResolver extends NameResolver {
       }
     }
 
-    private long generateHash(List<HashPolicy> hashPolicies, Map<String, String> headers) {
+    private long generateHash(List<HashPolicy> hashPolicies, Metadata headers) {
       Long hash = null;
       for (HashPolicy policy : hashPolicies) {
         Long newHash = null;
         if (policy.type() == HashPolicy.Type.HEADER) {
-          if (headers.containsKey(policy.headerName())) {
-            String value = headers.get(policy.headerName());
+          String value = getHeaderValue(headers, policy.headerName());
+          if (value != null) {
             if (policy.regEx() != null && policy.regExSubstitution() != null) {
               value = policy.regEx().matcher(value).replaceAll(policy.regExSubstitution());
             }
@@ -565,19 +586,20 @@ final class XdsNameResolver extends NameResolver {
 
   @VisibleForTesting
   static boolean matchRoute(RouteMatch routeMatch, String fullMethodName,
-      Map<String, String> headers, ThreadSafeRandom random) {
+      Metadata headers, ThreadSafeRandom random) {
     if (!matchPath(routeMatch.pathMatcher(), fullMethodName)) {
       return false;
     }
-    if (!matchHeaders(routeMatch.headerMatchers(), headers)) {
-      return false;
+    for (HeaderMatcher headerMatcher : routeMatch.headerMatchers()) {
+      if (!matchHeader(headerMatcher, getHeaderValue(headers, headerMatcher.name()))) {
+        return false;
+      }
     }
     FractionMatcher fraction = routeMatch.fractionMatcher();
     return fraction == null || random.nextInt(fraction.denominator()) < fraction.numerator();
   }
 
-  @VisibleForTesting
-  static boolean matchPath(PathMatcher pathMatcher, String fullMethodName) {
+  private static boolean matchPath(PathMatcher pathMatcher, String fullMethodName) {
     if (pathMatcher.path() != null) {
       return pathMatcher.caseSensitive()
           ? pathMatcher.path().equals(fullMethodName)
@@ -590,18 +612,8 @@ final class XdsNameResolver extends NameResolver {
     return pathMatcher.regEx().matches(fullMethodName);
   }
 
-  private static boolean matchHeaders(
-      List<HeaderMatcher> headerMatchers, Map<String, String> headers) {
-    for (HeaderMatcher headerMatcher : headerMatchers) {
-      if (!matchHeader(headerMatcher, headers.get(headerMatcher.name()))) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  @VisibleForTesting
-  static boolean matchHeader(HeaderMatcher headerMatcher, @Nullable String value) {
+  // TODO(zivy): consider reuse Matchers.HeaderMatcher.matches()
+  private static boolean matchHeader(HeaderMatcher headerMatcher, @Nullable String value) {
     if (headerMatcher.present() != null) {
       return (value == null) == headerMatcher.present().equals(headerMatcher.inverted());
     }
@@ -630,6 +642,24 @@ final class XdsNameResolver extends NameResolver {
     return baseMatch != headerMatcher.inverted();
   }
 
+  @Nullable
+  private static String getHeaderValue(Metadata headers, String headerName) {
+    if (headerName.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
+      return null;
+    }
+    if (headerName.equals("content-type")) {
+      return "application/grpc";
+    }
+    Metadata.Key<String> key;
+    try {
+      key = Metadata.Key.of(headerName, Metadata.ASCII_STRING_MARSHALLER);
+    } catch (IllegalArgumentException e) {
+      return null;
+    }
+    Iterable<String> values = headers.getAll(key);
+    return values == null ? null : Joiner.on(",").join(values);
+  }
+
   private class ResolveState implements LdsResourceWatcher {
     private final ConfigOrError emptyServiceConfig =
         serviceConfigParser.parseServiceConfig(Collections.<String, Object>emptyMap());
@@ -653,14 +683,17 @@ final class XdsNameResolver extends NameResolver {
             return;
           }
           logger.log(XdsLogLevel.INFO, "Receive LDS resource update: {0}", update);
-          List<VirtualHost> virtualHosts = update.virtualHosts;
-          String rdsName = update.rdsName;
+          HttpConnectionManager httpConnectionManager = update.httpConnectionManager();
+          List<VirtualHost> virtualHosts = httpConnectionManager.virtualHosts();
+          String rdsName = httpConnectionManager.rdsName();
           cleanUpRouteDiscoveryState();
           if (virtualHosts != null) {
-            updateRoutes(virtualHosts, update.httpMaxStreamDurationNano, update.filterChain);
+            updateRoutes(virtualHosts, httpConnectionManager.httpMaxStreamDurationNano(),
+                httpConnectionManager.httpFilterConfigs());
           } else {
             routeDiscoveryState = new RouteDiscoveryState(
-                rdsName, update.httpMaxStreamDurationNano, update.filterChain);
+                rdsName, httpConnectionManager.httpMaxStreamDurationNano(),
+                httpConnectionManager.httpFilterConfigs());
             logger.log(XdsLogLevel.INFO, "Start watching RDS resource {0}", rdsName);
             xdsClient.watchRdsResource(rdsName, routeDiscoveryState);
           }
@@ -744,11 +777,13 @@ final class XdsNameResolver extends NameResolver {
       Set<String> clusters = new HashSet<>();
       for (Route route : routes) {
         RouteAction action = route.routeAction();
-        if (action.cluster() != null) {
-          clusters.add(action.cluster());
-        } else if (action.weightedClusters() != null) {
-          for (ClusterWeight weighedCluster : action.weightedClusters()) {
-            clusters.add(weighedCluster.name());
+        if (action != null) {
+          if (action.cluster() != null) {
+            clusters.add(action.cluster());
+          } else if (action.weightedClusters() != null) {
+            for (ClusterWeight weighedCluster : action.weightedClusters()) {
+              clusters.add(weighedCluster.name());
+            }
           }
         }
       }

@@ -64,19 +64,20 @@ public class ServerWrapperForXdsTest {
   private int port;
   private XdsClientWrapperForServerSds xdsClientWrapperForServerSds;
   private XdsServerBuilder.XdsServingStatusListener mockXdsServingStatusListener;
-  private XdsClient mockXdsClient;
   private XdsClient.LdsResourceWatcher listenerWatcher;
   private Server mockServer;
+  private TlsContextManager tlsContextManager;
 
   @Before
   public void setUp() throws IOException {
     port = XdsServerTestHelper.findFreePort();
     mockDelegateBuilder = mock(ServerBuilder.class);
-    xdsClientWrapperForServerSds = new XdsClientWrapperForServerSds(port);
+    tlsContextManager = mock(TlsContextManager.class);
+    xdsClientWrapperForServerSds = XdsServerTestHelper
+        .createXdsClientWrapperForServerSds(port, tlsContextManager);
     mockXdsServingStatusListener = mock(XdsServerBuilder.XdsServingStatusListener.class);
-    mockXdsClient = mock(XdsClient.class);
     listenerWatcher =
-        XdsServerTestHelper.startAndGetWatcher(xdsClientWrapperForServerSds, mockXdsClient, port);
+        XdsServerTestHelper.startAndGetWatcher(xdsClientWrapperForServerSds);
     mockServer = mock(Server.class);
     when(mockDelegateBuilder.build()).thenReturn(mockServer);
     serverWrapperForXds = new ServerWrapperForXds(mockDelegateBuilder,
@@ -99,7 +100,12 @@ public class ServerWrapperForXdsTest {
       }
     });
     // wait until xdsClientWrapperForServerSds.serverWatchers populated
-    for (int i = 0; i < 10 && xdsClientWrapperForServerSds.serverWatchers.isEmpty(); i++) {
+    for (int i = 0; i < 10; i++) {
+      synchronized (xdsClientWrapperForServerSds.serverWatchers) {
+        if (!xdsClientWrapperForServerSds.serverWatchers.isEmpty()) {
+          break;
+        }
+      }
       Thread.sleep(100L);
     }
     return settableFuture;
@@ -113,8 +119,8 @@ public class ServerWrapperForXdsTest {
     verifyCapturedCodeAndNotServing(Status.Code.ABORTED, ServerWrapperForXds.ServingState.STARTING);
     XdsServerTestHelper.generateListenerUpdate(
         listenerWatcher,
-        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT1", "VA1")
-    );
+        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT1", "VA1"),
+        tlsContextManager);
     Throwable exception = future.get(2, TimeUnit.SECONDS);
     assertThat(exception).isNull();
     assertThat(serverWrapperForXds.getCurrentServingState())
@@ -159,8 +165,8 @@ public class ServerWrapperForXdsTest {
       public void run() {
         XdsServerTestHelper.generateListenerUpdate(
             listenerWatcher,
-            CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2")
-        );
+            CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2"),
+            tlsContextManager);
       }
     }).start();
     assertThat(settableFutureToSignalStart.get()).isNull();
@@ -193,9 +199,9 @@ public class ServerWrapperForXdsTest {
       @Override
       public void run() {
         XdsServerTestHelper.generateListenerUpdate(
-                listenerWatcher,
-                CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2")
-        );
+            listenerWatcher,
+            CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2"),
+            tlsContextManager);
       }
     }).start();
     Throwable exception = future.get(2, TimeUnit.SECONDS);
@@ -238,8 +244,8 @@ public class ServerWrapperForXdsTest {
     Future<Throwable> future = startServerAsync();
     XdsServerTestHelper.generateListenerUpdate(
         listenerWatcher,
-        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2")
-    );
+        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2"),
+        tlsContextManager);
     Throwable exception = future.get(2, TimeUnit.SECONDS);
     assertThat(exception).isNull();
     assertThat(serverWrapperForXds.getCurrentServingState())
@@ -252,8 +258,8 @@ public class ServerWrapperForXdsTest {
     when(mockDelegateBuilder.build()).thenReturn(mockServer);
     XdsServerTestHelper.generateListenerUpdate(
         listenerWatcher,
-        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT3", "VA3")
-    );
+        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT3", "VA3"),
+        tlsContextManager);
     Thread.sleep(100L);
     assertThat(serverWrapperForXds.getCurrentServingState())
         .isEqualTo(ServerWrapperForXds.ServingState.SHUTDOWN);
@@ -265,8 +271,8 @@ public class ServerWrapperForXdsTest {
     Future<Throwable> future = startServerAsync();
     XdsServerTestHelper.generateListenerUpdate(
         listenerWatcher,
-        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2")
-    );
+        CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2"),
+        tlsContextManager);
     Throwable exception = future.get(2, TimeUnit.SECONDS);
     assertThat(exception).isNull();
     assertThat(serverWrapperForXds.getCurrentServingState())
@@ -298,8 +304,8 @@ public class ServerWrapperForXdsTest {
       public void run() {
         XdsServerTestHelper.generateListenerUpdate(
             listenerWatcher,
-            CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2")
-        );
+            CommonTlsContextTestsUtil.buildTestInternalDownstreamTlsContext("CERT2", "VA2"),
+            tlsContextManager);
       }
     }).start();
     assertThat(settableFutureToSignalStart.get()).isNull();

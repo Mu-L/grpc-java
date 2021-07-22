@@ -30,11 +30,11 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.grpc.xds.Bootstrapper;
+import io.grpc.xds.CommonBootstrapperTestUtils;
 import io.grpc.xds.EnvoyServerProtoData.DownstreamTlsContext;
 import io.grpc.xds.EnvoyServerProtoData.UpstreamTlsContext;
 import io.grpc.xds.internal.sds.ReferenceCountingMap.ValueFactory;
-import java.lang.reflect.Field;
-import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -53,20 +53,16 @@ public class TlsContextManagerTest {
 
   @Mock ValueFactory<DownstreamTlsContext, SslContextProvider> mockServerFactory;
 
-  @Before
-  public void clearInstance() throws NoSuchFieldException, IllegalAccessException {
-    Field field = TlsContextManagerImpl.class.getDeclaredField("instance");
-    field.setAccessible(true);
-    field.set(null, null);
-  }
-
   @Test
   public void createServerSslContextProvider() {
+    Bootstrapper.BootstrapInfo bootstrapInfoForServer = CommonBootstrapperTestUtils
+        .buildBootstrapInfo("google_cloud_private_spiffe-server", SERVER_1_KEY_FILE,
+            SERVER_1_PEM_FILE, CA_PEM_FILE, null, null, null, null);
     DownstreamTlsContext downstreamTlsContext =
-        CommonTlsContextTestsUtil.buildDownstreamTlsContextFromFilenames(
-            SERVER_1_KEY_FILE, SERVER_1_PEM_FILE, /* trustCa= */ null);
+        CommonTlsContextTestsUtil.buildDownstreamTlsContext(
+            "google_cloud_private_spiffe-server", false, false);
 
-    TlsContextManagerImpl tlsContextManagerImpl = TlsContextManagerImpl.getInstance();
+    TlsContextManagerImpl tlsContextManagerImpl = new TlsContextManagerImpl(bootstrapInfoForServer);
     SslContextProvider serverSecretProvider =
         tlsContextManagerImpl.findOrCreateServerSslContextProvider(downstreamTlsContext);
     assertThat(serverSecretProvider).isNotNull();
@@ -78,11 +74,14 @@ public class TlsContextManagerTest {
 
   @Test
   public void createClientSslContextProvider() {
+    Bootstrapper.BootstrapInfo bootstrapInfoForClient = CommonBootstrapperTestUtils
+        .buildBootstrapInfo("google_cloud_private_spiffe-client", CLIENT_KEY_FILE, CLIENT_PEM_FILE,
+            CA_PEM_FILE, null, null, null, null);
     UpstreamTlsContext upstreamTlsContext =
-        CommonTlsContextTestsUtil.buildUpstreamTlsContextFromFilenames(
-            /* privateKey= */ null, /* certChain= */ null, CA_PEM_FILE);
+        CommonTlsContextTestsUtil
+            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", false);
 
-    TlsContextManagerImpl tlsContextManagerImpl = TlsContextManagerImpl.getInstance();
+    TlsContextManagerImpl tlsContextManagerImpl = new TlsContextManagerImpl(bootstrapInfoForClient);
     SslContextProvider clientSecretProvider =
         tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext);
     assertThat(clientSecretProvider).isNotNull();
@@ -94,18 +93,23 @@ public class TlsContextManagerTest {
 
   @Test
   public void createServerSslContextProvider_differentInstance() {
+    Bootstrapper.BootstrapInfo bootstrapInfoForServer = CommonBootstrapperTestUtils
+        .buildBootstrapInfo("google_cloud_private_spiffe-server", SERVER_1_KEY_FILE,
+            SERVER_1_PEM_FILE, CA_PEM_FILE, "cert-instance2", SERVER_0_KEY_FILE, SERVER_0_PEM_FILE,
+            CA_PEM_FILE);
     DownstreamTlsContext downstreamTlsContext =
-        CommonTlsContextTestsUtil.buildDownstreamTlsContextFromFilenames(
-            SERVER_1_KEY_FILE, SERVER_1_PEM_FILE, /* trustCa= */ null);
+        CommonTlsContextTestsUtil.buildDownstreamTlsContext(
+            "google_cloud_private_spiffe-server", false, false);
 
-    TlsContextManagerImpl tlsContextManagerImpl = TlsContextManagerImpl.getInstance();
+    TlsContextManagerImpl tlsContextManagerImpl = new TlsContextManagerImpl(bootstrapInfoForServer);
     SslContextProvider serverSecretProvider =
         tlsContextManagerImpl.findOrCreateServerSslContextProvider(downstreamTlsContext);
     assertThat(serverSecretProvider).isNotNull();
 
     DownstreamTlsContext downstreamTlsContext1 =
-        CommonTlsContextTestsUtil.buildDownstreamTlsContextFromFilenames(
-            SERVER_0_KEY_FILE, SERVER_0_PEM_FILE, CA_PEM_FILE);
+        CommonTlsContextTestsUtil.buildDownstreamTlsContext(
+            "cert-instance2", true, true);
+
     SslContextProvider serverSecretProvider1 =
         tlsContextManagerImpl.findOrCreateServerSslContextProvider(downstreamTlsContext1);
     assertThat(serverSecretProvider1).isNotNull();
@@ -114,18 +118,20 @@ public class TlsContextManagerTest {
 
   @Test
   public void createClientSslContextProvider_differentInstance() {
+    Bootstrapper.BootstrapInfo bootstrapInfoForClient = CommonBootstrapperTestUtils
+        .buildBootstrapInfo("google_cloud_private_spiffe-client", CLIENT_KEY_FILE, CLIENT_PEM_FILE,
+            CA_PEM_FILE, "cert-instance-2", CLIENT_KEY_FILE, CLIENT_PEM_FILE, CA_PEM_FILE);
     UpstreamTlsContext upstreamTlsContext =
-        CommonTlsContextTestsUtil.buildUpstreamTlsContextFromFilenames(
-            /* privateKey= */ null, /* certChain= */ null, CA_PEM_FILE);
+        CommonTlsContextTestsUtil
+            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", false);
 
-    TlsContextManagerImpl tlsContextManagerImpl = TlsContextManagerImpl.getInstance();
+    TlsContextManagerImpl tlsContextManagerImpl = new TlsContextManagerImpl(bootstrapInfoForClient);
     SslContextProvider clientSecretProvider =
         tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext);
     assertThat(clientSecretProvider).isNotNull();
 
     UpstreamTlsContext upstreamTlsContext1 =
-        CommonTlsContextTestsUtil.buildUpstreamTlsContextFromFilenames(
-            CLIENT_KEY_FILE, CLIENT_PEM_FILE, CA_PEM_FILE);
+        CommonTlsContextTestsUtil.buildUpstreamTlsContext("cert-instance-2", true);
 
     SslContextProvider clientSecretProvider1 =
         tlsContextManagerImpl.findOrCreateClientSslContextProvider(upstreamTlsContext1);
@@ -135,8 +141,8 @@ public class TlsContextManagerTest {
   @Test
   public void createServerSslContextProvider_releaseInstance() {
     DownstreamTlsContext downstreamTlsContext =
-        CommonTlsContextTestsUtil.buildDownstreamTlsContextFromFilenames(
-            SERVER_1_KEY_FILE, SERVER_1_PEM_FILE, /* trustCa= */ null);
+        CommonTlsContextTestsUtil.buildDownstreamTlsContext(
+            "google_cloud_private_spiffe-server", false, false);
 
     TlsContextManagerImpl tlsContextManagerImpl =
         new TlsContextManagerImpl(mockClientFactory, mockServerFactory);
@@ -154,8 +160,8 @@ public class TlsContextManagerTest {
   @Test
   public void createClientSslContextProvider_releaseInstance() {
     UpstreamTlsContext upstreamTlsContext =
-        CommonTlsContextTestsUtil.buildUpstreamTlsContextFromFilenames(
-            CLIENT_KEY_FILE, CLIENT_PEM_FILE, CA_PEM_FILE);
+        CommonTlsContextTestsUtil
+            .buildUpstreamTlsContext("google_cloud_private_spiffe-client", true);
 
     TlsContextManagerImpl tlsContextManagerImpl =
         new TlsContextManagerImpl(mockClientFactory, mockServerFactory);
